@@ -1,0 +1,143 @@
+with policyEvents as (
+SELECT dim_agreement_natural_key_hash_uuid
+    , stage_ID
+    , workflow_type_cde
+    , UPPER(stage_cde) AS stageCode
+    , stage_start_dtm  AS startTime
+    , stage_end_dtm    AS endTime
+    , stage_definition_txt AS stageDef
+    , LEAD(UPPER(stage_cde), 1) OVER (PARTITION BY dim_agreement_natural_key_hash_uuid ORDER BY stage_start_dtm ASC) AS nextStage
+FROM edw_vw.rel_agreement_stage_current_vw
+WHERE source_system_id = 354
+ORDER BY 1,3,5
+),
+UW AS (
+    SELECT p.dim_agreement_natural_key_hash_uuid
+        , (VoltageAccess(dp.first_nm,'name') || ' ' ||  VoltageAccess(dp.last_nm, 'name')) AS uw_nm
+        , UPPER(VoltageAccess(xr.sor_party_id,'sorparty')) AS uw_mm_id
+        , pa.begin_dtm
+    FROM edw_vw.dim_agreement_current_vw                                       p
+        LEFT OUTER JOIN edw_vw.rel_non_mastered_party_nb_agreement_current_vw pa ON p.dim_agreement_natural_key_hash_uuid = pa.dim_agreement_natural_key_hash_uuid
+        LEFT OUTER JOIN edw_vw.rel_non_master_party_xref_current_vw           xr ON pa.dim_non_mastered_party_natural_key_hash_uuid = xr.dim_non_mastered_party_natural_key_hash_uuid
+                                                                                    AND xr.party_id_type_cde = 'Mm_id'
+        LEFT OUTER JOIN edw_vw.dim_non_mastered_party_current_vw              dp ON pa.dim_non_mastered_party_natural_key_hash_uuid = dp.dim_non_mastered_party_natural_key_hash_uuid
+    WHERE pa.source_system_id = 354
+         AND pa.source_party_role_cde IN ('Underwriter', 'Uwmanager')
+),
+labsUploaded as(
+WITH labsPre AS (
+    SELECT d.dim_agreement_natural_key_hash_uuid
+        , CASE d.policy_document_source_cde
+            WHEN 'Algo'     THEN 'M3S'
+            WHEN 'Uploaded' THEN 'Manual'
+            ELSE 'Other lab upload'
+        END                     AS labUploadMethod
+        , d.policy_document_nm  AS labDoc
+        , d.policy_document_dtm AS labDocDate
+    FROM edw_vw.rel_agreement_nb_document_current_vw d
+    WHERE d.source_system_id = 354
+        AND d.policy_doc_type_cde = 'Lab Results'
+),
+firstLab AS (
+    SELECT dim_agreement_natural_key_hash_uuid
+        , FIRST_VALUE(labUploadMethod) OVER(PARTITION BY dim_agreement_natural_key_hash_uuid ORDER BY labDocDate) AS labUploadMethod
+        , FIRST_VALUE(labDocDate)      OVER(PARTITION BY dim_agreement_natural_key_hash_uuid ORDER BY labDocDate) AS labDocDate
+    FROM labsPre
+)
+SELECT dim_agreement_natural_key_hash_uuid
+    , labUploadMethod
+    , labDocDate
+FROM firstLab
+GROUP BY 1,2,3
+ORDER BY 1),
+litetouch as(
+SELECT upol.dim_agreement_natural_key_hash_uuid
+    , MAX(rr.output_score_txt)          AS lte_op --it's always 99, but it's here to reduce the group by
+    , MAX(rr.litetouch_output_score_nr) AS lte_lt_op
+FROM edw_vw.rel_agreement_nb_detail_current_vw   rr
+    INNER JOIN edw_vw.dim_agreement_current_vw upol ON rr.dim_agreement_natural_key_hash_uuid = upol.dim_agreement_natural_key_hash_uuid
+WHERE rr.source_system_id = 354
+    AND rr.rule_nm = 'Lite_touch_eligibility'
+    AND rr.output_score_txt = '99'
+    AND rr.litetouch_output_score_nr IN ('99','999')
+    AND upol.application_agreement_type_cde NOT IN ('Secondary')
+    AND rr.gate_nr = '0'
+GROUP BY 1
+ORDER BY 1),
+
+UwInfo as(
+
+SELECT p.dim_agreement_natural_key_hash_uuid
+    , uw.uw_nm AS uw_nm
+    , uw.uw_mm_id  AS uw_mm_id
+     ,p.application_nr
+    , p.final_rt_class_cde
+    , p.underwriting_type_cde
+    , CASE
+        WHEN p.underwriting_type_cde = 'Litetouch' AND lb.labUploadMethod IS NOT NULL THEN 'Manual'
+        WHEN p.underwriting_type_cde = 'Manual'    AND lb.labUploadMethod IS     NULL AND lte.lte_op = '99' AND lte.lte_lt_op IN ('99','999') THEN 'LiteTouch'
+        WHEN p.underwriting_type_cde = 'Litetouch'   THEN 'LiteTouch'
+        ELSE p.underwriting_type_cde
+    END AS finalUWType
+    , uw.begin_dtm              AS uw_begin_dtm
+FROM edw_vw.dim_agreement_current_vw  p
+    LEFT OUTER JOIN UW               uw ON p.dim_agreement_natural_key_hash_uuid = uw.dim_agreement_natural_key_hash_uuid
+    LEFT OUTER JOIN labsUploaded     lb ON p.dim_agreement_natural_key_hash_uuid = lb.dim_agreement_natural_key_hash_uuid
+    LEFT OUTER JOIN litetouch       lte ON p.dim_agreement_natural_key_hash_uuid = lte.dim_agreement_natural_key_hash_uuid
+WHERE p.source_system_id = 354
+GROUP BY 1,2,3,4,5,6,7,8
+ORDER BY 1),
+
+ UW_activities as (
+SELECT dim_agreement_natural_key_hash_uuid 
+    , action_nm                 AS activity_nm
+    , source_role_cde           AS type_cde
+    , action_created_dtm        AS activity_start_dtm
+    , source_manager_user_id    AS UW_MMID
+    
+FROM edw_vw.rel_agreement_case_action_log_current_vw
+WHERE source_system_id = 354
+    AND source_role_cde IN ('Underwriter', 'Uwmanager', 'System')
+UNION ALL
+--decisions pre-cah
+SELECT dim_agreement_natural_key_hash_uuid
+    , 'Confirm Decision'        AS activity_nm
+    , NULL::VARCHAR(50)         AS type_cde
+    , stage_decision_dtm        AS activity_start_dtm
+    , NULL                      AS UW_MMID
+FROM edw_work.policyDates
+WHERE stage_decision_dtm < '2018-10-03'
+UNION ALL
+--aps pre-cah
+SELECT dim_agreement_natural_key_hash_uuid
+    , 'APS Ordered'             AS activity_nm
+    , NULL::VARCHAR(50)         AS type_cde
+    , startTime                 AS activity_start_dtm
+    , NULL                      AS UW_MMID
+  FROM policyEvents
+WHERE startTime < '2018-10-03'
+    AND stageDef LIKE '%Awaiting APS%'
+UNION ALL
+--follow-ups
+SELECT p.dim_agreement_natural_key_hash_uuid
+    , 'Follow-up'               AS activity_nm
+    , p.type_cde                AS type_cde
+    , p.begin_dt                AS activity_start_dtm
+    , COALESCE(ui.uw_mm_id,pd.latest_decision_user_id) AS UW_MMID
+  FROM edw_vw.rel_agreement_nb_follow_up_current_vw p
+    LEFT OUTER JOIN uwInfo             ui ON p.dim_agreement_natural_key_hash_uuid = ui.dim_agreement_natural_key_hash_uuid
+    LEFT OUTER JOIN edw_work.UW_policydecisions pd on p.dim_agreement_natural_key_hash_uuid = pd.dim_agreement_natural_key_hash_uuid
+ORDER BY 1)
+
+SELECT uwa.dim_agreement_natural_key_hash_uuid
+    , dd.calendar_dt
+    , UPPER(uwa.UW_MMID) AS underwriter_mmid
+  ,(CASE WHEN uwa.activity_nm = 'Aps Ordered'          THEN 1 ELSE NULL END) AS aps_request_cnt
+    FROM edw_vw.dim_date_vw dd
+    LEFT OUTER JOIN UW_activities uwa ON uwa.activity_start_dtm::DATE = dd.calendar_dt
+   INNER JOIN edw_vw.dim_agreement_current_vw da ON uwa.dim_agreement_natural_key_hash_uuid = da.dim_agreement_natural_key_hash_uuid
+ WHERE dd.calendar_dt < CURRENT_DATE()
+--WHERE dd.calendar_dt = CURRENT_DATE() -1
+and LTRIM(da.agreement_nr,'0') = '1100152813'
+GROUP BY 1,2,3,4
+ORDER BY 2,1;
